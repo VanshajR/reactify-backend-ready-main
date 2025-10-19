@@ -1,0 +1,27 @@
+import { useEffect, useRef } from 'react';
+import { useMeeting } from '@/context/MeetingContext';
+import { User, Mic, MicOff } from 'lucide-react';
+
+interface VideoGridProps {
+  localStream: MediaStream | null;
+  screenStream: MediaStream | null;
+  remoteStreams: Map<string, MediaStream>;
+}
+
+const RemoteVideo = ({ stream, participantName, isMuted, isVideoOff }: { stream: MediaStream | null; participantName: string; isMuted: boolean; isVideoOff: boolean; }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => { if (videoRef.current && stream) { videoRef.current.srcObject = stream; } }, [stream]);
+  return (<div className="group relative bg-gradient-to-br from-card/90 to-card rounded-2xl overflow-hidden border border-border/50 hover:border-accent/50 transition-all shadow-xl hover:shadow-accent/20">{isVideoOff || !stream ? (<div className="w-full h-full bg-gradient-to-br from-secondary to-secondary/50 flex flex-col items-center justify-center aspect-video"><div className="w-16 h-16 rounded-full bg-accent/20 flex items-center justify-center mb-2"><User className="w-8 h-8 text-accent" /></div><span className="text-sm text-muted-foreground font-medium">Camera Off</span></div>) : (<video ref={videoRef} autoPlay playsInline className="w-full aspect-video object-cover bg-black" />)}<div className="absolute bottom-3 left-3 right-3 flex items-center justify-between"><div className="bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-lg text-xs font-semibold border border-white/10 shadow-lg">{participantName}</div>{isMuted && (<div className="bg-destructive/90 backdrop-blur-md p-1.5 rounded-lg"><MicOff className="w-3 h-3 text-white" /></div>)}</div></div>);
+};
+
+const VideoGrid = ({ localStream, screenStream, remoteStreams }: VideoGridProps) => {
+  const { participants, isVideoOff, isAudioMuted } = useMeeting();
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const screenVideoRef = useRef<HTMLVideoElement>(null);
+  useEffect(() => { if (localVideoRef.current && localStream) { localVideoRef.current.srcObject = localStream; } }, [localStream]);
+  useEffect(() => { if (screenVideoRef.current && screenStream) { screenVideoRef.current.srcObject = screenStream; } }, [screenStream]);
+  const gridCols = participants.length === 0 ? 'grid-cols-1' : participants.length === 1 ? 'grid-cols-2' : participants.length <= 4 ? 'grid-cols-2' : participants.length <= 9 ? 'grid-cols-3' : 'grid-cols-4';
+  return (<div className="h-full w-full p-4 overflow-hidden">{screenStream ? (<div className="h-full flex gap-4"><div className="flex-1 bg-black rounded-2xl overflow-hidden shadow-2xl border border-border/50"><video ref={screenVideoRef} autoPlay playsInline className="w-full h-full object-contain" /></div><div className="w-64 space-y-3 overflow-y-auto custom-scrollbar"><div className="group relative bg-gradient-to-br from-card/90 to-card rounded-2xl overflow-hidden border border-border/50 hover:border-primary/30 transition-all shadow-lg hover:shadow-primary/20">{isVideoOff ? (<div className="aspect-video bg-gradient-to-br from-secondary to-secondary/50 flex flex-col items-center justify-center"><div className="w-12 h-12 rounded-full bg-primary/20 flex items-center justify-center mb-2"><User className="w-8 h-8 text-primary" /></div><span className="text-sm text-muted-foreground">Camera Off</span></div>) : (<video ref={localVideoRef} autoPlay playsInline muted className="w-full aspect-video object-cover bg-black transform scale-x-[-1]" />)}<div className="absolute bottom-3 left-3 right-3 flex items-center justify-between"><div className="bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-lg text-sm font-medium border border-white/10">You</div>{isAudioMuted && (<div className="bg-destructive/90 backdrop-blur-md p-1.5 rounded-lg"><MicOff className="w-3.5 h-3.5 text-white" /></div>)}</div></div>{participants.map((participant) => (<RemoteVideo key={participant.id} stream={remoteStreams.get(participant.id) || null} participantName={participant.name} isMuted={participant.isMuted || false} isVideoOff={participant.isVideoOff || false} />))}</div></div>) : (<div className={`grid ${gridCols} gap-4 h-full auto-rows-fr`}><div className="group relative bg-gradient-to-br from-card/90 to-card rounded-2xl overflow-hidden border border-border/50 hover:border-primary/50 transition-all shadow-xl hover:shadow-primary/20">{isVideoOff ? (<div className="w-full h-full bg-gradient-to-br from-secondary to-secondary/50 flex flex-col items-center justify-center"><div className="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mb-2"><User className="w-8 h-8 text-primary" /></div><span className="text-sm text-muted-foreground font-medium">Camera Off</span></div>) : (<video ref={localVideoRef} autoPlay playsInline muted className="w-full aspect-video object-cover bg-black transform scale-x-[-1]" />)}<div className="absolute bottom-4 left-4 right-4 flex items-center justify-between"><div className="bg-black/70 backdrop-blur-md px-4 py-2 rounded-xl text-sm font-semibold border border-white/10 shadow-lg">You</div>{isAudioMuted && (<div className="bg-destructive/90 backdrop-blur-md p-2 rounded-xl shadow-lg"><MicOff className="w-4 h-4 text-white" /></div>)}</div></div>{participants.map((participant) => (<RemoteVideo key={participant.id} stream={remoteStreams.get(participant.id) || null} participantName={participant.name} isMuted={participant.isMuted || false} isVideoOff={participant.isVideoOff || false} />))}</div>)}</div>);
+};
+
+export default VideoGrid;
