@@ -205,6 +205,7 @@ io.on('connection', (socket) => {
  isVideoOff: false,
  isScreenSharing: false,
  });
+ console.log(`   ✅ Added ${userName} (${socket.id}) to room Map. Room size: ${room.size}`);
 
  permissions.set(socket.id, {
  allowAudio: true,
@@ -219,6 +220,7 @@ io.on('connection', (socket) => {
  
  // Send existing participants to the newly joined admin
  socket.emit('existing-participants', existingParticipants);
+ console.log(`   📢 Emitting admin-status: TRUE to ${userName} (${socket.id})`);
  socket.emit('admin-status', { isAdmin: true });
  
  // Notify others that admin joined
@@ -235,6 +237,10 @@ io.on('connection', (socket) => {
  }
 
  // Non-admin goes to waiting room
+ // IMPORTANT: Guest must join Socket.IO room to receive admit-user event!
+ socket.join(roomId);
+ console.log(`   ✅ ${userName} joined Socket.IO room ${roomId} (in waiting room)`);
+ 
  const waiting = waitingRoom.get(roomId);
  waiting.push({
  socketId: socket.id,
@@ -244,6 +250,7 @@ io.on('connection', (socket) => {
  });
 
  socket.emit('waiting-room', { message: 'Waiting for admin to admit you' });
+ console.log(`   📢 Emitting admin-status: FALSE to ${userName} (${socket.id})`);
  socket.emit('admin-status', { isAdmin: false });
  
  // Notify all admins in the room
@@ -305,13 +312,12 @@ io.on('connection', (socket) => {
  return;
  }
  
- // JOIN THE SOCKET.IO ROOM FIRST!
- userSocket.join(roomId);
- console.log(`✅ ${user.name} joined Socket.IO room ${roomId}`);
+ // User is already in Socket.IO room (joined when waiting room started)
+ console.log(`✅ ${user.name} already in Socket.IO room ${roomId} from waiting room`);
  
  // Verify they're actually in the room
  const roomSockets = io.sockets.adapter.rooms.get(roomId);
- console.log(`   Socket.IO room ${roomId} now has ${roomSockets?.size || 0} sockets`);
+ console.log(`   Socket.IO room ${roomId} has ${roomSockets?.size || 0} sockets`);
  
  // Add to our tracking Map
  room.set(socketId, {
@@ -601,19 +607,97 @@ io.on('connection', (socket) => {
  console.log(`Recording stopped in room ${roomId}`);
  });
 
- socket.on('disconnect', () => {
+ socket.on('disconnect', async (reason) => {
  console.log('🔌 Client disconnected:', socket.id);
+ console.log('   Disconnect reason:', reason);
+ console.log('   Total rooms:', rooms.size);
  
- // Clean up from rooms
- rooms.forEach((room, roomId) => {
+ let foundInRoom = false;
+ 
+ // Clean up from rooms - use for...of to support async operations
+ for (const [roomId, room] of rooms.entries()) {
+ console.log(`   Checking room ${roomId}, participants: ${room.size}`);
  if (room.has(socket.id)) {
- const userName = room.get(socket.id)?.name || 'Unknown';
- console.log(`   👋 ${userName} left room ${roomId}`);
+ foundInRoom = true;
+ const userData = room.get(socket.id);
+ const userName = userData?.name || 'Unknown';
+ const wasAdmin = userData?.isAdmin || false;
+ console.log(`   ✅ Found ${userName} in room ${roomId} (isAdmin: ${wasAdmin})`);
  room.delete(socket.id);
+ console.log(`   ✅ Deleted ${socket.id} from room. Remaining: ${room.size}`);
+ 
+ // Get list of remaining socket IDs
+ const remainingSockets = Array.from(room.keys());
+ console.log(`   Remaining sockets in room:`, remainingSockets);
+ 
+ // If admin left and there are still participants, transfer admin to first user
+ if (wasAdmin && room.size > 0) {
+ const newAdminSocketId = remainingSockets[0];
+ const newAdminData = room.get(newAdminSocketId);
+ if (newAdminData) {
+ newAdminData.isAdmin = true;
+ room.set(newAdminSocketId, newAdminData);
+ 
+ // Update permissions for new admin (grant all permissions)
+ permissions.set(newAdminSocketId, {
+ allowAudio: true,
+ allowVideo: true,
+ allowScreenShare: true,
+ });
+ 
+ console.log(`   👑 Admin left! Transferring admin to ${newAdminData.name} (${newAdminSocketId})`);
+ console.log(`   🔑 Granted full permissions to new admin`);
+ 
+ // Update database - transfer ownership to new admin
+ try {
+ const meeting = await Meeting.findOneAndUpdate(
+ { meetingId: roomId },
+ { createdBy: newAdminData.userIdentifier },
+ { new: true }
+ );
+ if (meeting) {
+ console.log(`   💾 Updated database: new owner is ${newAdminData.userIdentifier}`);
+ } else {
+ console.log(`   ⚠️ Could not find meeting ${roomId} in database`);
+ }
+ } catch (error) {
+ console.error(`   ❌ Error updating meeting ownership:`, error);
+ }
+ 
+ // Get the new admin's socket directly
+ const newAdminSocket = io.sockets.sockets.get(newAdminSocketId);
+ if (newAdminSocket) {
+ // Notify the new admin directly
+ newAdminSocket.emit('admin-status', { isAdmin: true });
+ newAdminSocket.emit('admin-transferred', { 
+ message: 'You are now the meeting host' 
+ });
+ console.log(`   📤 Sent admin-transferred to ${newAdminData.name}`);
+ } else {
+ console.log(`   ❌ Could not find socket for new admin ${newAdminSocketId}`);
+ }
+ 
+ // Notify all other participants in the room
+ remainingSockets.forEach(socketId => {
+ if (socketId !== newAdminSocketId) {
+ const participantSocket = io.sockets.sockets.get(socketId);
+ if (participantSocket) {
+ participantSocket.emit('new-admin', { 
+ socketId: newAdminSocketId,
+ name: newAdminData.name 
+ });
+ console.log(`   📤 Sent new-admin notification to ${socketId}`);
+ }
+ }
+ });
+ 
+ console.log(`   ✅ ${newAdminData.name} is now the admin of room ${roomId}`);
+ }
+ }
  
  // Notify remaining participants using io.to() to ensure delivery
  io.to(roomId).emit('user-left', { id: socket.id });
- console.log(`   📢 Broadcasted user-left event to room ${roomId} (${room.size} remaining)`);
+ console.log(`   📢 Broadcasted user-left event to room ${roomId}`);
  
  if (room.size === 0) {
  rooms.delete(roomId);
@@ -623,19 +707,26 @@ io.on('connection', (socket) => {
  console.log(`   🏠 Room ${roomId} is now empty. Scheduled for deletion in 5 minutes.`);
  }
  }
- });
+ }
+ 
+ if (!foundInRoom) {
+ console.log(`   ⚠️ Socket ${socket.id} was NOT found in any room!`);
+ }
 
  // Clean up from waiting rooms
  waitingRoom.forEach((waiting, roomId) => {
  const index = waiting.findIndex(u => u.socketId === socket.id);
  if (index !== -1) {
  waiting.splice(index, 1);
- console.log(`Removed ${socket.id} from waiting room ${roomId}`);
+ console.log(`   🚪 Removed ${socket.id} from waiting room ${roomId}`);
  }
  });
 
  // Clean up permissions
+ if (permissions.has(socket.id)) {
  permissions.delete(socket.id);
+ console.log(`   🔑 Cleaned up permissions for ${socket.id}`);
+ }
  });
 });
 

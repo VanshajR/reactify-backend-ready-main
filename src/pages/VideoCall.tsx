@@ -60,9 +60,23 @@ const VideoCall = () => {
  const [waitingUsers, setWaitingUsers] = useState<Array<{ socketId: string; name: string; joinedAt: Date }>>([]);
  const [participantPermissions, setParticipantPermissions] = useState<Map<string, { allowAudio: boolean; allowVideo: boolean; allowScreenShare: boolean }>>(new Map());
  const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
+ const [myPermissions, setMyPermissions] = useState<{ allowAudio: boolean; allowVideo: boolean; allowScreenShare: boolean }>({ allowAudio: true, allowVideo: true, allowScreenShare: true });
  const screenStreamRef = useRef<MediaStream | null>(null);
  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
  const recordedChunksRef = useRef<Blob[]>([]);
+ 
+ // Refs to access latest values in cleanup handlers without causing re-renders
+ const socketRef = useRef(socket);
+ const localStreamRef = useRef(localStream);
+ 
+ // Keep refs updated
+ useEffect(() => {
+ socketRef.current = socket;
+ }, [socket]);
+ 
+ useEffect(() => {
+ localStreamRef.current = localStream;
+ }, [localStream]);
 
  // Initialize WebRTC with remote streams
  const { remoteStreams, replaceTrack, addLocalTracksToPeers } = useWebRTC(socket, localStream, meetingId || '');
@@ -303,14 +317,16 @@ const VideoCall = () => {
  initMedia();
 
  return () => {
+ // Cleanup media on unmount or when socket/meeting changes
  if (localStream) {
+ console.log('Stopping local stream tracks from initMedia cleanup');
  localStream.getTracks().forEach(track => track.stop());
  }
  if (screenStreamRef.current) {
  screenStreamRef.current.getTracks().forEach(track => track.stop());
  }
  };
- }, [meetingValid, socket, meetingId, userName, isAdmin, toast, navigate]);
+ }, [meetingValid, socket, meetingId, userName, toast, navigate]); // REMOVED isAdmin - it was causing re-initialization
 
  useEffect(() => {
  if (!socket || !meetingId) return;
@@ -332,16 +348,23 @@ const VideoCall = () => {
 
  // Listen for admin status from backend
  socket.on('admin-status', ({ isAdmin: adminStatus }: { isAdmin: boolean }) => {
- console.log('🔐 Received admin status from backend:', adminStatus);
+ console.log('🔐 Received admin-status event from backend:', adminStatus);
+ console.log('   Current inWaitingRoom state:', inWaitingRoom);
+ console.log('   Current isAdmin state:', isAdmin);
+ 
  setIsAdmin(adminStatus);
+ 
  if (adminStatus) {
- console.log('👑 Confirmed as admin - bypassing waiting room');
+ console.log('👑 Confirmed as ADMIN - bypassing waiting room');
  setInWaitingRoom(false);
  notificationSounds.playMeetingStart(); // Play sound when meeting starts for admin
+ console.log('   Set inWaitingRoom to FALSE');
  } else {
- console.log('👤 Not admin - in waiting room (backend already notified admins)');
+ console.log('👤 Not admin - should be in waiting room');
  // Backend's join-room handler already put us in waiting room
  // and notified admins, so we just wait here
+ setInWaitingRoom(true); // Explicitly set to true for non-admins
+ console.log('   Set inWaitingRoom to TRUE');
  }
  });
 
@@ -353,12 +376,22 @@ const VideoCall = () => {
 
  // Waiting room and admission events
  socket.on('join-request', ({ socketId, name }: { socketId: string; name: string }) => {
- console.log(`🚪 Join request received from ${name} (${socketId})`);
- console.log(`   Current waiting users before adding:`, waitingUsers.length);
+ console.log(`🚪 JOIN-REQUEST received from ${name} (${socketId})`);
+ console.log(`   Current isAdmin:`, isAdmin);
+ console.log(`   Current waiting users count:`, waitingUsers.length);
+ console.log(`   Current waiting users:`, waitingUsers.map(u => u.name));
  
  setWaitingUsers((prev) => {
+ // Check if already in waiting list (prevent duplicates)
+ const alreadyWaiting = prev.find(u => u.socketId === socketId);
+ if (alreadyWaiting) {
+ console.log(`   ⚠️ ${name} already in waiting list, skipping`);
+ return prev;
+ }
+ 
  const updated = [...prev, { socketId, name, joinedAt: new Date() }];
- console.log(`   Updated waiting users:`, updated.length);
+ console.log(`   ✅ Added ${name} to waiting list. New count:`, updated.length);
+ console.log(`   Waiting users now:`, updated.map(u => u.name));
  return updated;
  });
  
@@ -397,27 +430,74 @@ const VideoCall = () => {
 
  socket.on('permissions', (permissions: { allowAudio: boolean; allowVideo: boolean; allowScreenShare: boolean }) => {
  console.log('🔑 Received permissions:', permissions);
- // Apply permissions
+ 
+ // Store permissions
+ setMyPermissions(permissions);
+ 
+ // Force apply permissions
  if (!permissions.allowAudio && localStream) {
  const audioTrack = localStream.getAudioTracks()[0];
- if (audioTrack) audioTrack.enabled = false;
+ if (audioTrack) {
+ audioTrack.enabled = false;
  setIsAudioMuted(true);
  }
+ toast({
+ title: '🔇 Audio Disabled',
+ description: 'The host has disabled your microphone',
+ variant: 'destructive',
+ duration: 3000,
+ });
+ }
+ 
  if (!permissions.allowVideo && localStream) {
  const videoTrack = localStream.getVideoTracks()[0];
  if (videoTrack) {
- videoTrack.stop();
- localStream.removeTrack(videoTrack);
- }
+ videoTrack.enabled = false;
  setIsVideoOff(true);
+ }
+ toast({
+ title: '📹 Video Disabled',
+ description: 'The host has disabled your camera',
+ variant: 'destructive',
+ duration: 3000,
+ });
+ }
+ 
+ if (!permissions.allowScreenShare && isScreenSharing && screenStreamRef.current) {
+ // Stop screen sharing immediately
+ const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+ if (screenTrack) screenTrack.stop();
+ screenStreamRef.current = null;
+ setIsScreenSharing(false);
+ 
+ toast({
+ title: '🖥️ Screen Share Disabled',
+ description: 'The host has disabled screen sharing',
+ variant: 'destructive',
+ duration: 3000,
+ });
  }
  });
 
  socket.on('user-joined', (participant: any) => {
- console.log(`👤 User joined: ${participant.name}`);
+ console.log(`👤 USER-JOINED event received`);
+ console.log(`   Participant:`, participant);
+ console.log(`   Current participants count:`, participants.length);
+ console.log(`   Current waiting users count:`, waitingUsers.length);
+ 
  setParticipants((prev) => [...prev, participant]);
+ 
  // Remove from waiting list if they were there
- setWaitingUsers((prev) => prev.filter(u => u.socketId !== participant.id));
+ setWaitingUsers((prev) => {
+ const filtered = prev.filter(u => u.socketId !== participant.id);
+ console.log(`   Removed ${participant.name} from waiting list`);
+ console.log(`   Waiting users count after removal:`, filtered.length);
+ if (filtered.length > 0) {
+ console.log(`   Remaining waiting users:`, filtered.map(u => u.name));
+ }
+ return filtered;
+ });
+ 
  notificationSounds.playUserJoined();
  toast({
  title: '👤 User Joined',
@@ -439,6 +519,37 @@ const VideoCall = () => {
  });
  }
  return prev.filter(p => p.id !== id);
+ });
+ });
+
+ // Handle admin transfer when current admin leaves
+ socket.on('admin-transferred', ({ message }: { message: string }) => {
+ console.log('👑 ADMIN-TRANSFERRED: You are now the admin!');
+ setIsAdmin(true);
+ toast({
+ title: '👑 Host Transfer',
+ description: message,
+ duration: 3000,
+ });
+ });
+
+ // Notify about new admin (for other participants)
+ socket.on('new-admin', ({ socketId, name }: { socketId: string; name: string }) => {
+ console.log(`👑 NEW-ADMIN: ${name} is now the admin`);
+ 
+ // Update the participant's admin status
+ setParticipants((prev) => 
+ prev.map(p => 
+ p.id === socketId 
+ ? { ...p, isAdmin: true }
+ : { ...p, isAdmin: false } // Remove admin from others
+ )
+ );
+ 
+ toast({
+ title: '👑 New Host',
+ description: `${name} is now the meeting host`,
+ duration: 2000,
  });
  });
 
@@ -554,6 +665,8 @@ const VideoCall = () => {
  socket.off('permissions');
  socket.off('user-joined');
  socket.off('user-left');
+ socket.off('admin-transferred');
+ socket.off('new-admin');
  socket.off('chat-message');
  socket.off('existing-participants');
  socket.off('kicked-from-meeting');
@@ -568,31 +681,43 @@ const VideoCall = () => {
  };
  }, [socket, meetingId, setParticipants, setMessages, toast, navigate, isChatOpen]); // Added setMessages and isChatOpen
 
- // Cleanup on component unmount - stop all tracks and clear messages
+ // Cleanup on component unmount ONLY - stop all tracks and clear messages
  useEffect(() => {
  return () => {
- console.log('🧹 Cleaning up VideoCall component');
+ console.log('🧹 Cleaning up VideoCall component on UNMOUNT');
+ 
+ // Use refs to get latest values without re-running effect
+ const currentLocalStream = localStreamRef.current;
+ const currentSocket = socketRef.current;
+ const currentScreenStream = screenStreamRef.current;
+ const currentMediaRecorder = mediaRecorderRef.current;
  
  // Stop all local stream tracks
- if (localStream) {
- localStream.getTracks().forEach(track => {
+ if (currentLocalStream) {
+ currentLocalStream.getTracks().forEach(track => {
  console.log(`  Stopping ${track.kind} track`);
  track.stop();
  });
  }
  
  // Stop screen share tracks
- if (screenStreamRef.current) {
- screenStreamRef.current.getTracks().forEach(track => {
+ if (currentScreenStream) {
+ currentScreenStream.getTracks().forEach(track => {
  console.log(`  Stopping screen share track`);
  track.stop();
  });
  }
  
  // Stop recording if active
- if (mediaRecorderRef.current && isRecording) {
+ if (currentMediaRecorder && isRecording) {
  console.log('  Stopping recording');
- mediaRecorderRef.current.stop();
+ currentMediaRecorder.stop();
+ }
+ 
+ // Disconnect socket to trigger backend cleanup
+ if (currentSocket && currentSocket.connected) {
+ console.log('  Disconnecting socket on unmount:', currentSocket.id);
+ currentSocket.disconnect();
  }
  
  // Clear chat messages for next meeting
@@ -604,31 +729,77 @@ const VideoCall = () => {
  
  console.log('✅ VideoCall cleanup complete');
  };
- }, [localStream, isRecording, setMessages, setParticipants]); // Dependencies ensure we have latest refs
+ }, []); // EMPTY array - only run on mount/unmount, NOT when dependencies change!
 
+ // Handle browser close/refresh - ensure socket disconnects
+ useEffect(() => {
+ const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+ console.log('⚠️ Browser closing/refreshing - disconnecting socket');
+ 
+ // Use refs to get latest values
+ const currentSocket = socketRef.current;
+ const currentLocalStream = localStreamRef.current;
+ const currentScreenStream = screenStreamRef.current;
+ 
+ if (currentSocket && currentSocket.connected) {
+ currentSocket.disconnect();
+ }
+ 
+ // Stop all tracks
+ if (currentLocalStream) {
+ currentLocalStream.getTracks().forEach(track => track.stop());
+ }
+ 
+ if (currentScreenStream) {
+ currentScreenStream.getTracks().forEach(track => track.stop());
+ }
+ };
+ 
+ window.addEventListener('beforeunload', handleBeforeUnload);
+ 
+ return () => {
+ window.removeEventListener('beforeunload', handleBeforeUnload);
+ };
+ }, []); // Empty array - handler uses refs to access current values
+ 
  const toggleAudio = () => {
- if (localStream) {
+ if (!localStream) return;
+
+ // Check permissions before allowing unmute
+ if (!myPermissions.allowAudio && isAudioMuted) {
+ toast({
+ title: '🔇 Audio Disabled',
+ description: 'The host has disabled your microphone',
+ variant: 'destructive',
+ duration: 2000,
+ });
+ return;
+ }
+
  const audioTrack = localStream.getAudioTracks()[0];
  if (audioTrack) {
  audioTrack.enabled = !audioTrack.enabled;
  setIsAudioMuted(!audioTrack.enabled);
- 
- // Play notification sound
- if (!audioTrack.enabled) {
- notificationSounds.playToggleOff();
- } else {
- notificationSounds.playToggleOn();
- }
- 
+
  if (socket && meetingId) {
  socket.emit('toggle-audio', { roomId: meetingId, isMuted: !audioTrack.enabled });
- }
  }
  }
  };
 
  const toggleVideo = async () => {
  if (!localStream) return;
+
+ // Check permissions before allowing camera turn on
+ if (!myPermissions.allowVideo && isVideoOff) {
+ toast({
+ title: '📹 Video Disabled',
+ description: 'The host has disabled your camera',
+ variant: 'destructive',
+ duration: 2000,
+ });
+ return;
+ }
 
  try {
  if (isVideoOff) {
@@ -748,6 +919,17 @@ const VideoCall = () => {
  duration: 2000,
  });
  } else {
+ // Check permissions before allowing screen share
+ if (!myPermissions.allowScreenShare) {
+ toast({
+ title: '🖥️ Screen Share Disabled',
+ description: 'The host has disabled screen sharing',
+ variant: 'destructive',
+ duration: 2000,
+ });
+ return;
+ }
+ 
  // Start screen sharing
  try {
  console.log('🖥️ Starting screen share');
@@ -870,12 +1052,12 @@ const VideoCall = () => {
  return updated;
  });
  
- // Emit to server
- const updatedPermissions = participantPermissions.get(socketId) || { allowAudio: true, allowVideo: true, allowScreenShare: true };
- socket.emit('set-permissions', { 
+ // Emit to server - FIXED: Match backend event name and structure
+ socket.emit('set-permission', { 
  roomId: meetingId, 
- socketId, 
- permissions: { ...updatedPermissions, [permission]: value } 
+ targetSocketId: socketId,
+ permission: permission,
+ value: value
  });
  
  toast({
@@ -913,6 +1095,12 @@ const VideoCall = () => {
  console.log('  Clearing chat messages and participants');
  setMessages([]);
  setParticipants([]);
+ 
+ // Explicitly disconnect socket to trigger backend cleanup
+ if (socket) {
+ console.log('  Disconnecting socket:', socket.id);
+ socket.disconnect();
+ }
  
  console.log('✅ Cleanup complete, navigating to home');
  navigate('/');
