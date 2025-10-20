@@ -9,6 +9,8 @@ import { useWebRTC } from '@/hooks/useWebRTC';
 import VideoGrid from '@/components/VideoGrid';
 import ChatPanel from '@/components/ChatPanel';
 import ParticipantsList from '@/components/ParticipantsList';
+import AdminPanel from '@/components/AdminPanel';
+import WaitingRoom from '@/components/WaitingRoom';
 import { notificationSounds } from '@/utils/notifications';
 import axios from 'axios';
 
@@ -39,19 +41,29 @@ const VideoCall = () => {
  } = useMeeting();
 
  const userName = searchParams.get('name') || 'Guest';
- const isAdmin = searchParams.get('admin') === 'true';
  const startWithAudio = searchParams.get('audio') !== 'false'; // default true
  const startWithVideo = searchParams.get('video') !== 'false'; // default true
+ const [isAdmin, setIsAdmin] = useState(false); // Will be set by backend
+ 
+ console.log('🔍 VideoCall initialized:', { 
+   userName,
+   meetingId
+ });
+ 
  const [isConnecting, setIsConnecting] = useState(true);
  const [meetingValid, setMeetingValid] = useState(false);
  const [soundsEnabled, setSoundsEnabled] = useState(true);
  const [isRecording, setIsRecording] = useState(false);
+ const [inWaitingRoom, setInWaitingRoom] = useState(true); // Start in waiting room, backend will determine admin status
+ const [waitingUsers, setWaitingUsers] = useState<Array<{ socketId: string; name: string; joinedAt: Date }>>([]);
+ const [participantPermissions, setParticipantPermissions] = useState<Map<string, { allowAudio: boolean; allowVideo: boolean; allowScreenShare: boolean }>>(new Map());
+ const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
  const screenStreamRef = useRef<MediaStream | null>(null);
  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
  const recordedChunksRef = useRef<Blob[]>([]);
 
  // Initialize WebRTC with remote streams
- const { remoteStreams } = useWebRTC(socket, localStream, meetingId || '');
+ const { remoteStreams, replaceTrack, addLocalTracksToPeers } = useWebRTC(socket, localStream, meetingId || '');
 
  // Toggle notification sounds
  const toggleSounds = () => {
@@ -197,6 +209,55 @@ const VideoCall = () => {
 
  useEffect(() => {
  if (!meetingValid) return; // Don't initialize media until meeting is validated
+ if (!socket) {
+ console.warn('⚠️ Socket not initialized yet, waiting...');
+ return;
+ }
+
+ console.log('🔌 Socket status:', { 
+ socketId: socket.id, 
+ connected: socket.connected,
+ meetingId,
+ userName 
+ });
+
+ // IMPORTANT: Join room FIRST, even if media fails
+ let userIdentifier = localStorage.getItem('reactify_user_id');
+ 
+ // TESTING: Force new identity if ?newUser=true in URL (for testing with same browser)
+ const forceNewUser = searchParams.get('newUser') === 'true';
+ if (forceNewUser) {
+ userIdentifier = `user_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+ localStorage.setItem('reactify_user_id', userIdentifier);
+ console.log('🆔 FORCED new userIdentifier for testing:', userIdentifier);
+ }
+ 
+ // If no userIdentifier exists, generate one (fallback for guests)
+ if (!userIdentifier) {
+ userIdentifier = `user_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+ localStorage.setItem('reactify_user_id', userIdentifier);
+ console.log('🆔 Generated new userIdentifier:', userIdentifier);
+ }
+ 
+ if (socket.connected && meetingId) {
+ console.log('🔐 Attempting to join with userIdentifier:', userIdentifier);
+ // Try to join - backend will determine if we're admin or need to request admission
+ socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
+ } else if (!socket.connected) {
+ console.warn('⚠️ Socket not connected yet, waiting for connection...');
+ // Wait for socket to connect
+ socket.once('connect', () => {
+ console.log('✅ Socket connected! Now joining room...');
+ socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
+ });
+ } else {
+ console.error('❌ Missing required data for join-room:', { 
+ hasSocket: !!socket,
+ socketConnected: socket.connected,
+ meetingId, 
+ userIdentifier 
+ });
+ }
 
  const initMedia = async () => {
  try {
@@ -226,22 +287,18 @@ const VideoCall = () => {
  setLocalStream(stream);
  setIsConnecting(false);
 
- 
- if (socket && meetingId) {
- if (isAdmin) {
- socket.emit('create-room', { roomId: meetingId, userName, isAdmin: true });
- } else {
- socket.emit('join-room', { roomId: meetingId, userName });
- }
- }
+ console.log('🎬 Local stream initialized, will add tracks to peers when they connect');
  } catch (error) {
- console.error('Error accessing media devices:', error);
+ console.error('❌ Error accessing media devices:', error);
  toast({
- title: 'Media Error',
- description: 'Could not access camera or microphone',
+ title: '⚠️ Media Error',
+ description: 'Could not access camera or microphone. You can still join without media.',
  variant: 'destructive',
+ duration: 5000,
  });
  setIsConnecting(false);
+ setIsVideoOff(true);
+ setIsAudioMuted(true);
  }
  };
 
@@ -260,8 +317,109 @@ const VideoCall = () => {
  useEffect(() => {
  if (!socket || !meetingId) return;
 
+ // Add socket error listeners
+ socket.on('connect_error', (error) => {
+ console.error('❌ Socket connection error:', error);
+ toast({
+ title: '❌ Connection Error',
+ description: 'Failed to connect to server. Please refresh.',
+ variant: 'destructive',
+ duration: 5000,
+ });
+ });
+
+ socket.on('error', (error) => {
+ console.error('❌ Socket error:', error);
+ });
+
+ // Listen for admin status from backend
+ socket.on('admin-status', ({ isAdmin: adminStatus }: { isAdmin: boolean }) => {
+ console.log('🔐 Received admin status from backend:', adminStatus);
+ setIsAdmin(adminStatus);
+ if (adminStatus) {
+ console.log('👑 Confirmed as admin - bypassing waiting room');
+ setInWaitingRoom(false);
+ notificationSounds.playMeetingStart(); // Play sound when meeting starts for admin
+ } else {
+ console.log('👤 Not admin - in waiting room (backend already notified admins)');
+ // Backend's join-room handler already put us in waiting room
+ // and notified admins, so we just wait here
+ }
+ });
+
+ // Backend notifies us when we're in waiting room
+ socket.on('waiting-room', ({ message }: { message: string }) => {
+ console.log('🚪 In waiting room:', message);
+ setInWaitingRoom(true);
+ });
+
+ // Waiting room and admission events
+ socket.on('join-request', ({ socketId, name }: { socketId: string; name: string }) => {
+ console.log(`🚪 Join request received from ${name} (${socketId})`);
+ console.log(`   Current waiting users before adding:`, waitingUsers.length);
+ 
+ setWaitingUsers((prev) => {
+ const updated = [...prev, { socketId, name, joinedAt: new Date() }];
+ console.log(`   Updated waiting users:`, updated.length);
+ return updated;
+ });
+ 
+ notificationSounds.playUserJoined();
+ toast({
+ title: '🚪 Join Request',
+ description: `${name} wants to join the meeting`,
+ duration: 5000,
+ });
+ });
+
+ socket.on('admitted', ({ roomId }: { roomId: string }) => {
+ console.log('✅ Admitted to meeting!');
+ setInWaitingRoom(false);
+ notificationSounds.playMeetingStart(); // Play sound when admitted participant enters meeting
+ // Backend already added us to the room, no need to emit join-room again
+ toast({
+ title: '✅ Admitted',
+ description: 'You have been admitted to the meeting',
+ duration: 3000,
+ });
+ });
+
+ socket.on('join-denied', ({ message }: { message: string }) => {
+ console.log('❌ Join request denied');
+ toast({
+ title: '❌ Access Denied',
+ description: message,
+ variant: 'destructive',
+ duration: 5000,
+ });
+ setTimeout(() => {
+ navigate('/');
+ }, 2000);
+ });
+
+ socket.on('permissions', (permissions: { allowAudio: boolean; allowVideo: boolean; allowScreenShare: boolean }) => {
+ console.log('🔑 Received permissions:', permissions);
+ // Apply permissions
+ if (!permissions.allowAudio && localStream) {
+ const audioTrack = localStream.getAudioTracks()[0];
+ if (audioTrack) audioTrack.enabled = false;
+ setIsAudioMuted(true);
+ }
+ if (!permissions.allowVideo && localStream) {
+ const videoTrack = localStream.getVideoTracks()[0];
+ if (videoTrack) {
+ videoTrack.stop();
+ localStream.removeTrack(videoTrack);
+ }
+ setIsVideoOff(true);
+ }
+ });
+
  socket.on('user-joined', (participant: any) => {
+ console.log(`👤 User joined: ${participant.name}`);
  setParticipants((prev) => [...prev, participant]);
+ // Remove from waiting list if they were there
+ setWaitingUsers((prev) => prev.filter(u => u.socketId !== participant.id));
  notificationSounds.playUserJoined();
  toast({
  title: 'User Joined',
@@ -270,11 +428,21 @@ const VideoCall = () => {
  });
 
  socket.on('user-left', ({ id }: { id: string }) => {
+ console.log(`👋 User left: ${id}`);
+ const leavingUser = participants.find(p => p.id === id);
  setParticipants((prev) => prev.filter(p => p.id !== id));
  notificationSounds.playUserLeft();
+ if (leavingUser) {
+ toast({
+ title: '👋 User Left',
+ description: `${leavingUser.name} left the meeting`,
+ duration: 3000,
+ });
+ }
  });
 
  socket.on('existing-participants', (existingParticipants: any[]) => {
+ console.log(`👥 Existing participants: ${existingParticipants.length}`);
  setParticipants(existingParticipants);
  });
 
@@ -285,9 +453,10 @@ const VideoCall = () => {
  }
  
  toast({
- title: 'Kicked from Meeting',
+ title: '⛔ Kicked from Meeting',
  description: message,
  variant: 'destructive',
+ duration: 5000,
  });
  setTimeout(() => {
  navigate('/');
@@ -301,9 +470,10 @@ const VideoCall = () => {
  setIsScreenSharing(false);
  
  toast({
- title: 'Screen Share Stopped',
+ title: '🛑 Screen Share Stopped',
  description: message,
  variant: 'destructive',
+ duration: 4000,
  });
  }
  });
@@ -335,16 +505,18 @@ const VideoCall = () => {
  socket.on('recording-started', () => {
  notificationSounds.playRecordingStart();
  toast({
- title: 'Recording Started',
+ title: '🔴 Recording Started',
  description: 'This meeting is now being recorded',
+ duration: 4000,
  });
  });
 
  socket.on('recording-stopped', () => {
  notificationSounds.playRecordingStop();
  toast({
- title: 'Recording Stopped',
+ title: '⏹️ Recording Stopped',
  description: 'Meeting recording has ended',
+ duration: 3000,
  });
  });
 
@@ -354,6 +526,12 @@ const VideoCall = () => {
  });
 
  return () => {
+ socket.off('admin-status');
+ socket.off('waiting-room');
+ socket.off('join-request');
+ socket.off('admitted');
+ socket.off('join-denied');
+ socket.off('permissions');
  socket.off('user-joined');
  socket.off('user-left');
  socket.off('existing-participants');
@@ -367,7 +545,7 @@ const VideoCall = () => {
  socket.off('recording-stopped');
  socket.off('user-kicked');
  };
- }, [socket, meetingId, setParticipants, toast, navigate, isScreenSharing]);
+ }, [socket, meetingId, setParticipants, toast, navigate]); // REMOVED: isScreenSharing, userName, localStream
 
  const toggleAudio = () => {
  if (localStream) {
@@ -396,6 +574,7 @@ const VideoCall = () => {
  try {
  if (isVideoOff) {
  // Turn video ON - get new video track
+ console.log('🎥 Turning camera ON');
  const newStream = await navigator.mediaDevices.getUserMedia({
  video: {
  width: { ideal: 1280 },
@@ -408,12 +587,15 @@ const VideoCall = () => {
  const newVideoTrack = newStream.getVideoTracks()[0];
  const oldVideoTrack = localStream.getVideoTracks()[0];
 
- // Replace the old video track with the new one
+ // Replace the old video track with the new one in local stream
  if (oldVideoTrack) {
  localStream.removeTrack(oldVideoTrack);
  oldVideoTrack.stop();
  }
  localStream.addTrack(newVideoTrack);
+
+ // Update the track in all peer connections
+ replaceTrack('video', newVideoTrack);
 
  // Force update by creating a new MediaStream reference
  const updatedStream = new MediaStream([
@@ -432,15 +614,20 @@ const VideoCall = () => {
  }
 
  toast({
- title: 'Camera On',
+ title: '📹 Camera On',
  description: 'Your camera is now on',
+ duration: 2000,
  });
  } else {
  // Turn video OFF - stop the track
+ console.log('🎥 Turning camera OFF');
  const videoTrack = localStream.getVideoTracks()[0];
  if (videoTrack) {
  videoTrack.stop();
  localStream.removeTrack(videoTrack);
+ 
+ // Update peer connections to remove video track
+ replaceTrack('video', null);
  
  setIsVideoOff(true);
  
@@ -452,8 +639,9 @@ const VideoCall = () => {
  }
 
  toast({
- title: 'Camera Off',
+ title: '📹 Camera Off',
  description: 'Your camera is now off',
+ duration: 2000,
  });
  }
  }
@@ -469,11 +657,23 @@ const VideoCall = () => {
 
  const toggleScreenShare = async () => {
  if (isScreenSharing) {
- // Stop screen sharing
+ // Stop screen sharing and revert to camera
+ console.log('🖥️ Stopping screen share');
  if (screenStreamRef.current) {
- screenStreamRef.current.getTracks().forEach(track => track.stop());
+ const screenTrack = screenStreamRef.current.getVideoTracks()[0];
+ screenTrack.stop();
  screenStreamRef.current = null;
  }
+ 
+ // Revert to camera track if camera is on
+ if (!isVideoOff && localStream) {
+ const cameraTrack = localStream.getVideoTracks()[0];
+ if (cameraTrack) {
+ console.log('🎥 Reverting to camera track');
+ await replaceTrack('video', cameraTrack, true); // Renegotiate to switch back
+ }
+ }
+ 
  setIsScreenSharing(false);
  
  if (socket && meetingId) {
@@ -481,17 +681,25 @@ const VideoCall = () => {
  }
 
  toast({
- title: 'Screen Share Stopped',
+ title: '🖥️ Screen Share Stopped',
  description: 'You stopped sharing your screen',
+ duration: 2000,
  });
  } else {
  // Start screen sharing
  try {
+ console.log('🖥️ Starting screen share');
  const screenStream = await navigator.mediaDevices.getDisplayMedia({
  video: true,
  });
  
  screenStreamRef.current = screenStream;
+ const screenTrack = screenStream.getVideoTracks()[0];
+ 
+ // Replace video track with screen share track in all peer connections
+ // Use renegotiate=true to ensure remote peers get the new track
+ await replaceTrack('video', screenTrack, true);
+ 
  setIsScreenSharing(true);
  
  if (socket && meetingId) {
@@ -499,19 +707,31 @@ const VideoCall = () => {
  }
 
  toast({
- title: 'Screen Sharing',
+ title: '🖥️ Screen Sharing',
  description: 'You are now sharing your screen',
+ duration: 3000,
  });
 
- screenStream.getVideoTracks()[0].onended = () => {
+ screenTrack.onended = async () => {
+ console.log('🖥️ Screen share ended by user');
  setIsScreenSharing(false);
  screenStreamRef.current = null;
+ 
+ // Revert to camera track
+ if (!isVideoOff && localStream) {
+ const cameraTrack = localStream.getVideoTracks()[0];
+ if (cameraTrack) {
+ await replaceTrack('video', cameraTrack, true); // Renegotiate when reverting
+ }
+ }
+ 
  if (socket && meetingId) {
  socket.emit('screen-share-stopped', { roomId: meetingId });
  }
  toast({
- title: 'Screen Share Stopped',
+ title: '🖥️ Screen Share Stopped',
  description: 'Screen sharing has ended',
+ duration: 2000,
  });
  };
  } catch (error: any) {
@@ -524,12 +744,82 @@ const VideoCall = () => {
  }
  
  toast({
- title: 'Screen Share Error',
+ title: '❌ Screen Share Error',
  description: 'Could not start screen sharing',
  variant: 'destructive',
+ duration: 4000,
  });
  }
  }
+ };
+
+ // Admin actions
+ const handleAdmitUser = (socketId: string) => {
+ if (!socket || !meetingId || !isAdmin) return;
+ 
+ console.log(`✅ Admitting user ${socketId}`);
+ const permissions = {
+ allowAudio: true,
+ allowVideo: true,
+ allowScreenShare: true,
+ };
+ 
+ socket.emit('admit-user', { roomId: meetingId, socketId, permissions });
+ 
+ // Remove from waiting list
+ const user = waitingUsers.find(u => u.socketId === socketId);
+ if (user) {
+ toast({
+ title: 'User Admitted',
+ description: `${user.name} has been admitted to the meeting`,
+ });
+ }
+ };
+
+ const handleDenyUser = (socketId: string) => {
+ if (!socket || !meetingId || !isAdmin) return;
+ 
+ console.log(`❌ Denying user ${socketId}`);
+ socket.emit('deny-user', { roomId: meetingId, socketId });
+ 
+ // Remove from waiting list
+ setWaitingUsers((prev) => prev.filter(u => u.socketId !== socketId));
+ 
+ const user = waitingUsers.find(u => u.socketId === socketId);
+ if (user) {
+ toast({
+ title: 'User Denied',
+ description: `${user.name} was denied access`,
+ variant: 'destructive',
+ });
+ }
+ };
+
+ const handleSetPermission = (socketId: string, permission: 'allowAudio' | 'allowVideo' | 'allowScreenShare', value: boolean) => {
+ if (!socket || !meetingId || !isAdmin) return;
+ 
+ console.log(`🔑 Setting ${permission} = ${value} for ${socketId}`);
+ 
+ // Update local state
+ setParticipantPermissions((prev) => {
+ const updated = new Map(prev);
+ const current = updated.get(socketId) || { allowAudio: true, allowVideo: true, allowScreenShare: true };
+ updated.set(socketId, { ...current, [permission]: value });
+ return updated;
+ });
+ 
+ // Emit to server
+ const updatedPermissions = participantPermissions.get(socketId) || { allowAudio: true, allowVideo: true, allowScreenShare: true };
+ socket.emit('set-permissions', { 
+ roomId: meetingId, 
+ socketId, 
+ permissions: { ...updatedPermissions, [permission]: value } 
+ });
+ 
+ toast({
+ title: 'Permissions Updated',
+ description: `${permission.replace('allow', '')} ${value ? 'allowed' : 'denied'}`,
+ });
  };
 
  const leaveMeeting = () => {
@@ -556,11 +846,30 @@ const VideoCall = () => {
  );
  }
 
+ // Show waiting room for non-admin users who haven't been admitted
+ if (inWaitingRoom && !isAdmin) {
+ return <WaitingRoom />;
+ }
+
  return (
  <div className="h-screen bg-slate-950 flex flex-col overflow-hidden">
  {/* Video Grid - Fixed height to fit screen */}
  <div className="flex-1 relative overflow-hidden">
  <VideoGrid localStream={localStream} screenStream={screenStreamRef.current} remoteStreams={remoteStreams} />
+ 
+ {/* Admin Panel */}
+ {isAdmin && isAdminPanelOpen && (
+ <div className="absolute right-0 top-0 h-full w-96 bg-slate-900 border-l border-slate-800 shadow-2xl overflow-y-auto">
+ <AdminPanel
+ waitingUsers={waitingUsers}
+ participants={participants}
+ participantPermissions={participantPermissions}
+ onAdmit={handleAdmitUser}
+ onDeny={handleDenyUser}
+ onSetPermission={handleSetPermission}
+ />
+ </div>
+ )}
  
  {/* Chat Panel */}
  {isChatOpen && (
@@ -665,12 +974,39 @@ const VideoCall = () => {
  </div>
  
  <div className="flex items-center gap-3">
+ {/* Admin Panel Button - Only for admins */}
+ {isAdmin && (
+ <Button
+ variant={isAdminPanelOpen ? 'default' : 'secondary'}
+ size="icon"
+ onClick={() => {
+ setIsAdminPanelOpen(!isAdminPanelOpen);
+ setIsChatOpen(false);
+ setIsParticipantsOpen(false);
+ }}
+ className={`h-11 w-11 rounded-full transition-all relative ${
+ isAdminPanelOpen 
+ ? 'bg-gradient-to-r from-blue-600 to-purple-600 text-white' 
+ : 'bg-slate-800 hover:bg-slate-700 text-white border border-slate-700'
+ }`}
+ title="Admin Panel"
+ >
+ <Users className="h-4 w-4" />
+ {waitingUsers.length > 0 && (
+ <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-600 rounded-full text-xs flex items-center justify-center font-bold">
+ {waitingUsers.length}
+ </span>
+ )}
+ </Button>
+ )}
+ 
  <Button
  variant={isChatOpen ? 'default' : 'secondary'}
  size="icon"
  onClick={() => {
  setIsChatOpen(!isChatOpen);
  setIsParticipantsOpen(false);
+ setIsAdminPanelOpen(false);
  }}
  className={`h-11 w-11 rounded-full transition-all ${
  isChatOpen 
@@ -688,6 +1024,7 @@ const VideoCall = () => {
  onClick={() => {
  setIsParticipantsOpen(!isParticipantsOpen);
  setIsChatOpen(false);
+ setIsAdminPanelOpen(false);
  }}
  className={`h-11 w-11 rounded-full transition-all ${
  isParticipantsOpen 

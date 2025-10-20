@@ -35,6 +35,14 @@ const JoinMeeting = () => {
 
  setLoading(true);
  try {
+ // Generate or get user identifier for the guest
+ let userId = localStorage.getItem('reactify_user_id');
+ if (!userId) {
+ userId = `user_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+ localStorage.setItem('reactify_user_id', userId);
+ console.log('🆔 Generated new user ID for guest:', userId);
+ }
+ 
  // Trim whitespace from meeting ID
  const cleanMeetingId = formData.meetingId.trim();
  
@@ -62,7 +70,8 @@ const JoinMeeting = () => {
  description: 'Connecting to the video call',
  });
 
- navigate(`/meeting/${cleanMeetingId}?name=${encodeURIComponent(formData.userName)}&audio=${formData.startWithAudio}&video=${formData.startWithVideo}`);
+ // Add newUser=true to force new identity (useful for testing in same browser)
+ navigate(`/meeting/${cleanMeetingId}?name=${encodeURIComponent(formData.userName)}&audio=${formData.startWithAudio}&video=${formData.startWithVideo}&newUser=true`);
  } catch (error: any) {
  const message = error.response?.data?.error || 'Failed to join meeting';
  toast({

@@ -129,7 +129,7 @@ const CreateMeeting = () => {
  description: 'Starting your video call...',
  });
 
- // Admin status will be verified by backend based on userId matching createdBy
+ // Admin status will be verified by backend based on userId
  navigate(`/meeting/${response.data.meetingId}?name=${encodeURIComponent(formData.userName)}&audio=${formData.startWithAudio}&video=${formData.startWithVideo}`);
  } catch (error) {
  toast({

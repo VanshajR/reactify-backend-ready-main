@@ -153,6 +153,9 @@ io.on('connection', (socket) => {
  });
 
  socket.on('join-room', async ({ roomId, userName, userIdentifier }) => {
+ console.log(`🔑 Join request: ${userName} (${socket.id}) trying to join ${roomId}`);
+ console.log(`   User Identifier: ${userIdentifier}`);
+ 
  if (!rooms.has(roomId)) {
  rooms.set(roomId, new Map());
  }
@@ -164,12 +167,15 @@ io.on('connection', (socket) => {
  let isActualAdmin = false;
  try {
  const meeting = await Meeting.findOne({ meetingId: roomId });
+ console.log(`   Meeting found: ${!!meeting}, createdBy: ${meeting?.createdBy}`);
  if (meeting && meeting.createdBy === userIdentifier) {
  isActualAdmin = true;
  }
  } catch (error) {
- console.error('Error verifying admin:', error);
+ console.error('❌ Error verifying admin:', error);
  }
+
+ console.log(`   Is Admin: ${isActualAdmin}`);
 
  // If admin, join directly
  if (isActualAdmin) {
@@ -223,11 +229,19 @@ io.on('connection', (socket) => {
  });
 
  socket.emit('waiting-room', { message: 'Waiting for admin to admit you' });
+ socket.emit('admin-status', { isAdmin: false });
  
  // Notify all admins in the room
  const room = rooms.get(roomId);
+ console.log(`🚪 ${userName} in waiting room. Notifying admins...`);
+ console.log(`   Room has ${room.size} participants`);
+ 
+ let adminCount = 0;
  room.forEach((participant, participantSocketId) => {
+ console.log(`   Participant ${participant.name} (${participantSocketId}): isAdmin=${participant.isAdmin}`);
  if (participant.isAdmin) {
+ adminCount++;
+ console.log(`   ✉️ Sending join-request to admin ${participant.name}`);
  io.to(participantSocketId).emit('join-request', {
  socketId: socket.id,
  name: userName,
@@ -236,32 +250,55 @@ io.on('connection', (socket) => {
  }
  });
 
- console.log(`${userName} is in waiting room for ${roomId}`);
+ console.log(`${userName} is in waiting room for ${roomId}. Notified ${adminCount} admin(s).`);
  });
 
  // Admin admit user
  socket.on('admit-user', ({ roomId, socketId }) => {
+ console.log(`🔓 Admin attempting to admit user ${socketId} to room ${roomId}`);
+ 
  const room = rooms.get(roomId);
  const participant = room.get(socket.id);
  
  // Verify requester is admin
  if (!participant || !participant.isAdmin) {
+ console.log(`❌ Admit denied - requester ${socket.id} is not admin`);
  return;
  }
 
  const waiting = waitingRoom.get(roomId);
+ if (!waiting) {
+ console.log(`❌ No waiting room found for ${roomId}`);
+ return;
+ }
+ 
  const userIndex = waiting.findIndex(u => u.socketId === socketId);
  
- if (userIndex === -1) return;
+ if (userIndex === -1) {
+ console.log(`❌ User ${socketId} not found in waiting room`);
+ return;
+ }
  
  const user = waiting[userIndex];
  waiting.splice(userIndex, 1);
+ console.log(`✅ Removed ${user.name} from waiting room`);
 
  // Add user to room
  const userSocket = io.sockets.sockets.get(socketId);
- if (userSocket) {
- userSocket.join(roomId);
+ if (!userSocket) {
+ console.log(`❌ Socket ${socketId} not found - user may have disconnected`);
+ return;
+ }
  
+ // JOIN THE SOCKET.IO ROOM FIRST!
+ userSocket.join(roomId);
+ console.log(`✅ ${user.name} joined Socket.IO room ${roomId}`);
+ 
+ // Verify they're actually in the room
+ const roomSockets = io.sockets.adapter.rooms.get(roomId);
+ console.log(`   Socket.IO room ${roomId} now has ${roomSockets?.size || 0} sockets`);
+ 
+ // Add to our tracking Map
  room.set(socketId, {
  id: socketId,
  name: user.name,
@@ -271,29 +308,28 @@ io.on('connection', (socket) => {
  isVideoOff: false,
  isScreenSharing: false,
  });
+ console.log(`✅ ${user.name} added to rooms Map. Room now has ${room.size} participants`);
 
- console.log(`User ${socketId} (${user.name}) added to room ${roomId}`);
- console.log(`Room ${roomId} now has ${room.size} participants`);
-
- // Set default permissions (non-admin starts with restrictions)
+ // Set default permissions
  permissions.set(socketId, {
- allowAudio: true, // Can unmute by default
- allowVideo: true, // Can turn on camera by default
- allowScreenShare: false, // Must request screen share
+ allowAudio: true,
+ allowVideo: true,
+ allowScreenShare: false,
  });
 
-     // Get current participants (excluding the newly admitted user)
-     const participants = Array.from(room.values()).filter(p => p.id !== socketId);
+ // Get current participants (excluding the newly admitted user)
+ const participants = Array.from(room.values()).filter(p => p.id !== socketId);
+ console.log(`📋 Sending ${participants.length} existing participant(s) to ${user.name}:`);
+ participants.forEach(p => console.log(`   - ${p.name} (${p.id})`));
 
-     console.log(`Sending ${participants.length} existing participants to ${user.name}`);
-     console.log('Existing participants data:', JSON.stringify(participants, null, 2));
+ // Notify admitted user - THEY ARE NOW IN THE SOCKET.IO ROOM
+ userSocket.emit('admitted', { roomId });
+ userSocket.emit('existing-participants', participants);
+ userSocket.emit('permissions', permissions.get(socketId));
+ console.log(`✅ Sent admitted, existing-participants, and permissions to ${user.name}`);
 
-     // Notify admitted user
-     userSocket.emit('admitted', { roomId });
-     userSocket.emit('existing-participants', participants);
-     userSocket.emit('permissions', permissions.get(socketId)); // Notify ALL participants in the room (including admin) about the newly admitted user
- // Use io.to instead of socket.to or userSocket.to
- console.log(`Broadcasting user-joined event for ${user.name} to room ${roomId}`);
+ // Notify ALL OTHER participants (including admin) about the newly admitted user
+ console.log(`📢 Broadcasting user-joined event for ${user.name} to ALL in room ${roomId} (except ${socketId})`);
  io.to(roomId).except(socketId).emit('user-joined', {
  id: socketId,
  name: user.name,
@@ -301,43 +337,56 @@ io.on('connection', (socket) => {
  isVideoOff: false,
  isAdmin: false,
  });
+ console.log(`✅ user-joined broadcast complete for ${user.name}`);
 
- console.log(`${user.name} admitted to room ${roomId}`);
- }
+ console.log(`🎉 ${user.name} successfully admitted to room ${roomId}`);
  });
 
  // Admin deny user
  socket.on('deny-user', ({ roomId, socketId }) => {
+ console.log(`🚫 Deny request: Admin attempting to deny ${socketId} from room ${roomId}`);
  const room = rooms.get(roomId);
- const participant = room.get(socket.id);
+ const participant = room?.get(socket.id);
  
  // Verify requester is admin
  if (!participant || !participant.isAdmin) {
+ console.log(`   ❌ Requester ${socket.id} is not admin!`);
  return;
  }
 
  const waiting = waitingRoom.get(roomId);
+ if (!waiting) {
+ console.log(`   ❌ No waiting room found for ${roomId}`);
+ return;
+ }
+ 
  const userIndex = waiting.findIndex(u => u.socketId === socketId);
  
  if (userIndex !== -1) {
+ const userName = waiting[userIndex].name;
  waiting.splice(userIndex, 1);
  
  const userSocket = io.sockets.sockets.get(socketId);
  if (userSocket) {
- userSocket.emit('denied', { message: 'Admin denied your request to join' });
+ userSocket.emit('join-denied', { message: 'The host denied your request to join the meeting' });
+ console.log(`   ✅ Sent join-denied event to ${userName}`);
  }
  
- console.log(`User ${socketId} denied access to room ${roomId}`);
+ console.log(`   🚫 User ${userName} (${socketId}) denied access to room ${roomId}`);
+ } else {
+ console.log(`   ❌ User ${socketId} not found in waiting room`);
  }
  });
 
  // Permission management
  socket.on('set-permission', ({ roomId, targetSocketId, permission, value }) => {
+ console.log(`🔐 Permission change: ${socket.id} setting ${permission}=${value} for ${targetSocketId} in ${roomId}`);
  const room = rooms.get(roomId);
- const requester = room.get(socket.id);
+ const requester = room?.get(socket.id);
  
  // Only admin can set permissions
  if (!requester || !requester.isAdmin) {
+ console.log(`   ❌ Requester is not admin`);
  return;
  }
 
@@ -346,9 +395,15 @@ io.on('connection', (socket) => {
  targetPerms[permission] = value;
  
  // Notify target user of permission change
- io.to(targetSocketId).emit('permissions', targetPerms);
- 
- console.log(`Admin set ${permission}=${value} for ${targetSocketId} in room ${roomId}`);
+ const targetSocket = io.sockets.sockets.get(targetSocketId);
+ if (targetSocket) {
+ targetSocket.emit('permissions', targetPerms);
+ console.log(`   ✅ Sent updated permissions to ${targetSocketId}:`, targetPerms);
+ } else {
+ console.log(`   ❌ Target socket ${targetSocketId} not found`);
+ }
+ } else {
+ console.log(`   ❌ No permissions found for ${targetSocketId}`);
  }
  });
 
@@ -375,26 +430,41 @@ io.on('connection', (socket) => {
 
  // WebRTC Signaling
  socket.on('offer', ({ to, offer, roomId }) => {
- io.to(to).emit('offer', {
+ console.log(`📞 WebRTC: Forwarding OFFER from ${socket.id} to ${to} in room ${roomId}`);
+ const toSocket = io.sockets.sockets.get(to);
+ if (toSocket) {
+ toSocket.emit('offer', {
  from: socket.id,
  offer,
  });
- console.log(`Offer sent from ${socket.id} to ${to}`);
+ console.log(`   ✅ Offer delivered to ${to}`);
+ } else {
+ console.log(`   ❌ Target socket ${to} not found!`);
+ }
  });
 
  socket.on('answer', ({ to, answer, roomId }) => {
- io.to(to).emit('answer', {
+ console.log(`📞 WebRTC: Forwarding ANSWER from ${socket.id} to ${to} in room ${roomId}`);
+ const toSocket = io.sockets.sockets.get(to);
+ if (toSocket) {
+ toSocket.emit('answer', {
  from: socket.id,
  answer,
  });
- console.log(`Answer sent from ${socket.id} to ${to}`);
+ console.log(`   ✅ Answer delivered to ${to}`);
+ } else {
+ console.log(`   ❌ Target socket ${to} not found!`);
+ }
  });
 
  socket.on('ice-candidate', ({ to, candidate, roomId }) => {
- io.to(to).emit('ice-candidate', {
+ const toSocket = io.sockets.sockets.get(to);
+ if (toSocket) {
+ toSocket.emit('ice-candidate', {
  from: socket.id,
  candidate,
  });
+ }
  });
 
  socket.on('send-signal', ({ to, signal, from }) => {
@@ -407,6 +477,10 @@ io.on('connection', (socket) => {
  });
 
  socket.on('chat-message', ({ roomId, message }) => {
+ console.log(`💬 Chat message from ${message.senderName} in room ${roomId}`);
+ console.log(`   Room has ${rooms.get(roomId)?.size || 0} participants`);
+ const room = io.sockets.adapter.rooms.get(roomId);
+ console.log(`   Socket.IO room has ${room?.size || 0} sockets`);
  io.to(roomId).emit('chat-message', message);
  });
 
@@ -508,20 +582,25 @@ io.on('connection', (socket) => {
  });
 
  socket.on('disconnect', () => {
- console.log('Client disconnected:', socket.id);
+ console.log('🔌 Client disconnected:', socket.id);
  
  // Clean up from rooms
  rooms.forEach((room, roomId) => {
  if (room.has(socket.id)) {
+ const userName = room.get(socket.id)?.name || 'Unknown';
+ console.log(`   👋 ${userName} left room ${roomId}`);
  room.delete(socket.id);
- socket.to(roomId).emit('user-left', { id: socket.id });
+ 
+ // Notify remaining participants using io.to() to ensure delivery
+ io.to(roomId).emit('user-left', { id: socket.id });
+ console.log(`   📢 Broadcasted user-left event to room ${roomId} (${room.size} remaining)`);
  
  if (room.size === 0) {
  rooms.delete(roomId);
  waitingRoom.delete(roomId);
  // Schedule auto-delete after 5 minutes of no participants
  scheduleAutoDelete(roomId);
- console.log(`Room ${roomId} is now empty. Scheduled for deletion in 5 minutes.`);
+ console.log(`   🏠 Room ${roomId} is now empty. Scheduled for deletion in 5 minutes.`);
  }
  }
  });

@@ -1,4 +1,4 @@
-import { useEffect, useRef, MutableRefObject } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Socket } from 'socket.io-client';
 
 interface Peer {
@@ -11,8 +11,11 @@ export const useWebRTC = (
   localStream: MediaStream | null,
   roomId: string | undefined
 ) => {
+  console.log('🎬 useWebRTC HOOK CALLED', { hasSocket: !!socket, hasLocalStream: !!localStream, roomId });
+  
   const peersRef = useRef<Map<string, Peer>>(new Map());
   const remoteStreamsRef = useRef<Map<string, MediaStream>>(new Map());
+  const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
 
   const ICE_SERVERS = {
     iceServers: [
@@ -25,20 +28,28 @@ export const useWebRTC = (
   };
 
   const createPeerConnection = (userId: string): RTCPeerConnection => {
+    console.log(`🔗 Creating peer connection for ${userId}`);
     const pc = new RTCPeerConnection(ICE_SERVERS);
 
     // Add local stream tracks to peer connection
     if (localStream) {
+      console.log(`🎥 Adding ${localStream.getTracks().length} tracks to peer connection for ${userId}`);
       localStream.getTracks().forEach((track) => {
+        console.log(`  ➕ Adding ${track.kind} track (enabled: ${track.enabled})`);
         pc.addTrack(track, localStream);
       });
+    } else {
+      console.warn(`⚠️ No local stream available when creating peer connection for ${userId}`);
     }
 
     // Handle incoming remote tracks
     pc.ontrack = (event) => {
+      console.log(`📡 Received ${event.track.kind} track from ${userId}`);
       const [remoteStream] = event.streams;
       if (remoteStream) {
+        console.log(`✅ Remote stream received from ${userId} (id: ${remoteStream.id})`);
         remoteStreamsRef.current.set(userId, remoteStream);
+        setRemoteStreams(new Map(remoteStreamsRef.current)); // Trigger React re-render
         
         // Store stream in peer object
         const peer = peersRef.current.get(userId);
@@ -61,26 +72,86 @@ export const useWebRTC = (
 
     // Handle connection state changes
     pc.onconnectionstatechange = () => {
-      console.log(`Peer connection with ${userId}: ${pc.connectionState}`);
+      console.log(`🔌 Peer connection with ${userId}: ${pc.connectionState}`);
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        console.log(`Connection with ${userId} ${pc.connectionState}, attempting to restart ICE`);
+        console.log(`❌ Connection with ${userId} ${pc.connectionState}, attempting to restart ICE`);
         pc.restartIce();
+      } else if (pc.connectionState === 'connected') {
+        console.log(`✅ Successfully connected to ${userId}`);
       }
     };
 
     return pc;
   };
 
-  const createOffer = async (userId: string) => {
-    if (!localStream) {
-      console.error('❌ Cannot create offer - No local stream available yet for user:', userId);
-      console.log('Retrying in 2 seconds...');
-      setTimeout(() => createOffer(userId), 2000);
-      return;
+  // Replace a specific track (video or audio) in all peer connections
+  const replaceTrack = async (kind: 'video' | 'audio', newTrack: MediaStreamTrack | null, renegotiate: boolean = false) => {
+    console.log(`🔄 Replacing ${kind} track for all ${peersRef.current.size} peers`);
+    console.log(`   New track:`, newTrack ? `${newTrack.kind} (enabled: ${newTrack.enabled})` : 'null');
+    console.log(`   Renegotiate: ${renegotiate}`);
+    
+    for (const [peerId, peer] of peersRef.current.entries()) {
+      const senders = peer.connection.getSenders();
+      const sender = senders.find(s => s.track?.kind === kind);
+      
+      if (sender) {
+        try {
+          await sender.replaceTrack(newTrack);
+          console.log(`✅ Successfully replaced ${kind} track for peer ${peerId}`);
+          
+          // If renegotiation is needed (e.g., for screen share), create new offer
+          if (renegotiate && socket && roomId) {
+            console.log(`🔄 Creating new offer for peer ${peerId} after track replacement`);
+            const offer = await peer.connection.createOffer();
+            await peer.connection.setLocalDescription(offer);
+            socket.emit('offer', {
+              to: peerId,
+              offer,
+              roomId,
+            });
+          }
+        } catch (err) {
+          console.error(`❌ Failed to replace ${kind} track for peer ${peerId}:`, err);
+        }
+      } else {
+        console.warn(`⚠️ No ${kind} sender found for peer ${peerId}`);
+      }
     }
+  };
 
-    console.log(`📞 Creating offer for user ${userId} (My stream ID: ${localStream.id})`);
-    console.log(`   Stream has ${localStream.getAudioTracks().length} audio tracks, ${localStream.getVideoTracks().length} video tracks`);
+  // Add local tracks to all existing peer connections
+  const addLocalTracksToPeers = (stream: MediaStream) => {
+    console.log(`🎬 Adding local tracks to all ${peersRef.current.size} existing peers`);
+    
+    peersRef.current.forEach((peer, peerId) => {
+      const existingSenders = peer.connection.getSenders();
+      
+      stream.getTracks().forEach(track => {
+        const existingSender = existingSenders.find(s => s.track?.kind === track.kind);
+        
+        if (!existingSender) {
+          console.log(`  ➕ Adding ${track.kind} track to peer ${peerId}`);
+          peer.connection.addTrack(track, stream);
+        } else {
+          console.log(`  🔄 Replacing ${track.kind} track for peer ${peerId}`);
+          existingSender.replaceTrack(track);
+        }
+      });
+    });
+  };
+
+  const createOffer = async (userId: string) => {
+    console.log(`📞 Attempting to create offer for user ${userId}`);
+    console.log(`   Local stream available: ${!!localStream}`);
+    
+    if (!localStream) {
+      console.warn('⚠️ No local stream yet - WebRTC will create connection without sending tracks initially');
+      // Still create the peer connection even without local stream
+      // Tracks can be added later when stream becomes available
+    } else {
+      console.log(`   Stream ID: ${localStream.id}`);
+      console.log(`   Audio tracks: ${localStream.getAudioTracks().length}, Video tracks: ${localStream.getVideoTracks().length}`);
+    }
     
     try {
       const pc = createPeerConnection(userId);
@@ -106,15 +177,15 @@ export const useWebRTC = (
   };
 
   const handleOffer = async (from: string, offer: RTCSessionDescriptionInit) => {
+    console.log(`📥 Received offer from ${from}, handling...`);
+    console.log(`   Local stream available: ${!!localStream}`);
+    
     if (!localStream) {
-      console.error('❌ Cannot handle offer - No local stream available yet from user:', from);
-      console.log('Retrying in 2 seconds...');
-      setTimeout(() => handleOffer(from, offer), 2000);
-      return;
+      console.warn('⚠️ No local stream yet - WebRTC will create connection and add tracks later');
+    } else {
+      console.log(`   Stream ID: ${localStream.id}`);
+      console.log(`   Audio tracks: ${localStream.getAudioTracks().length}, Video tracks: ${localStream.getVideoTracks().length}`);
     }
-
-    console.log(`📥 Received offer from ${from}, handling... (My stream ID: ${localStream.id})`);
-    console.log(`   Stream has ${localStream.getAudioTracks().length} audio tracks, ${localStream.getVideoTracks().length} video tracks`);
     
     try {
       const pc = createPeerConnection(from);
@@ -160,99 +231,82 @@ export const useWebRTC = (
   };
 
   const removePeer = (userId: string) => {
+    console.log(`👋 Removing peer ${userId}`);
     const peer = peersRef.current.get(userId);
     if (peer) {
       peer.connection.close();
       peersRef.current.delete(userId);
     }
     remoteStreamsRef.current.delete(userId);
-  };
-
-  const updateLocalStream = (newStream: MediaStream | null) => {
-    // Update tracks for all existing peer connections
-    peersRef.current.forEach((peer) => {
-      const senders = peer.connection.getSenders();
-      
-      if (newStream) {
-        const audioTrack = newStream.getAudioTracks()[0];
-        const videoTrack = newStream.getVideoTracks()[0];
-
-        senders.forEach((sender) => {
-          if (sender.track?.kind === 'audio' && audioTrack) {
-            sender.replaceTrack(audioTrack);
-          }
-          if (sender.track?.kind === 'video' && videoTrack) {
-            sender.replaceTrack(videoTrack);
-          }
-        });
-      } else {
-        // Remove tracks if stream is null
-        senders.forEach((sender) => {
-          if (sender.track) {
-            peer.connection.removeTrack(sender);
-          }
-        });
-      }
-    });
+    setRemoteStreams(new Map(remoteStreamsRef.current)); // Trigger React re-render
   };
 
   useEffect(() => {
-    if (!socket) return;
+    console.log('🎯 useWebRTC useEffect TRIGGERED', { hasSocket: !!socket, roomId });
+    
+    if (!socket || !roomId) {
+      console.log('❌ useWebRTC: Cannot set up listeners - missing socket or roomId');
+      return;
+    }
+
+    console.log('🔌 Setting up WebRTC socket listeners for room:', roomId);
 
     // Listen for WebRTC signaling events
     socket.on('offer', ({ from, offer }: { from: string; offer: RTCSessionDescriptionInit }) => {
+      console.log(`📨 RECEIVED OFFER from ${from}`);
       handleOffer(from, offer);
     });
 
     socket.on('answer', ({ from, answer }: { from: string; answer: RTCSessionDescriptionInit }) => {
+      console.log(`📨 RECEIVED ANSWER from ${from}`);
       handleAnswer(from, answer);
     });
 
     socket.on('ice-candidate', ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
+      console.log(`📨 RECEIVED ICE CANDIDATE from ${from}`);
       handleIceCandidate(from, candidate);
     });
 
     socket.on('user-joined', ({ id }: { id: string }) => {
-      console.log(`👤 User joined event received for ${id}`);
-      console.log(`   My local stream: ${localStream?.id || '⚠️ NO STREAM YET'}`);
+      console.log(`👤 ===== USER-JOINED EVENT RECEIVED for ${id} =====`);
       console.log(`   Already connected to this user: ${peersRef.current.has(id)}`);
+      console.log(`   Local stream available: ${!!localStream}`);
       
       // Create offer for new user only if we don't already have a connection
       if (!peersRef.current.has(id)) {
-        // Increased delay to ensure both parties have streams ready
-        setTimeout(() => {
-          console.log(`⏰ Now attempting to create offer for ${id}...`);
-          createOffer(id);
-        }, 2000);
+        // IMMEDIATELY create offer - don't wait
+        console.log(`🚀 Creating offer for ${id} IMMEDIATELY`);
+        createOffer(id);
+      } else {
+        console.log(`⚠️ Skipping offer - already connected to ${id}`);
       }
     });
 
     socket.on('existing-participants', (participants: Array<{ id: string }>) => {
-      console.log(`👥 Existing participants received: ${participants.length} participant(s)`);
+      console.log(`👥 ===== EXISTING-PARTICIPANTS EVENT RECEIVED =====`);
+      console.log(`   ${participants.length} participant(s)`);
       console.log(`   Participants:`, participants.map(p => p.id));
-      console.log(`   My local stream: ${localStream?.id || '⚠️ NO STREAM YET'}`);
+      console.log(`   Local stream available: ${!!localStream}`);
       
-      // Create offers for all existing participants
+      // Create offers for all existing participants IMMEDIATELY
       participants.forEach((participant) => {
         console.log(`   Checking participant ${participant.id}...`);
         if (!peersRef.current.has(participant.id)) {
-          console.log(`   Will create offer for ${participant.id}`);
-          // Increased delay to ensure both parties have streams ready
-          setTimeout(() => {
-            console.log(`⏰ Now attempting to create offer for existing participant ${participant.id}...`);
-            createOffer(participant.id);
-          }, 2000);
+          console.log(`   🚀 Creating offer for ${participant.id} IMMEDIATELY`);
+          createOffer(participant.id);
         } else {
-          console.log(`   Already connected to ${participant.id}, skipping`);
+          console.log(`   ⚠️ Already connected to ${participant.id}, skipping`);
         }
       });
     });
 
     socket.on('user-left', ({ id }: { id: string }) => {
+      console.log(`👋 User left event received for ${id}`);
       removePeer(id);
     });
 
     return () => {
+      console.log('🔌 Cleaning up WebRTC socket listeners');
       socket.off('offer');
       socket.off('answer');
       socket.off('ice-candidate');
@@ -260,12 +314,13 @@ export const useWebRTC = (
       socket.off('existing-participants');
       socket.off('user-left');
     };
-  }, [socket, localStream, roomId]);
+  }, [socket, roomId]); // REMOVED localStream from dependencies to prevent re-registration
 
-  // Update streams when local stream changes
+  // When localStream becomes available, add tracks to existing peer connections
   useEffect(() => {
-    if (localStream) {
-      updateLocalStream(localStream);
+    if (localStream && peersRef.current.size > 0) {
+      console.log(`🎬 Local stream NOW available! Adding tracks to ${peersRef.current.size} existing peer(s)`);
+      addLocalTracksToPeers(localStream);
     }
   }, [localStream]);
 
@@ -281,7 +336,9 @@ export const useWebRTC = (
   }, []);
 
   return {
-    remoteStreams: remoteStreamsRef.current,
+    remoteStreams,
+    replaceTrack,
+    addLocalTracksToPeers,
     createOffer,
   };
 };
