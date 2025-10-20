@@ -95,11 +95,12 @@ export const useWebRTC = (
       const sender = senders.find(s => s.track?.kind === kind);
       
       if (sender) {
+        // Sender exists - replace the track
         try {
           await sender.replaceTrack(newTrack);
           console.log(`✅ Successfully replaced ${kind} track for peer ${peerId}`);
           
-          // If renegotiation is needed (e.g., for screen share), create new offer
+          // If renegotiation is needed, create new offer
           if (renegotiate && socket && roomId) {
             console.log(`🔄 Creating new offer for peer ${peerId} after track replacement`);
             const offer = await peer.connection.createOffer();
@@ -113,31 +114,74 @@ export const useWebRTC = (
         } catch (err) {
           console.error(`❌ Failed to replace ${kind} track for peer ${peerId}:`, err);
         }
+      } else if (newTrack) {
+        // No sender exists and we have a new track - ADD it
+        console.warn(`⚠️ No ${kind} sender found for peer ${peerId}, ADDING track instead`);
+        try {
+          // Add the track to the peer connection
+          const stream = new MediaStream([newTrack]);
+          peer.connection.addTrack(newTrack, stream);
+          console.log(`✅ Added new ${kind} track to peer ${peerId}`);
+          
+          // MUST renegotiate when adding a track
+          if (socket && roomId) {
+            console.log(`🔄 Creating new offer for peer ${peerId} after ADDING track`);
+            const offer = await peer.connection.createOffer();
+            await peer.connection.setLocalDescription(offer);
+            socket.emit('offer', {
+              to: peerId,
+              offer,
+              roomId,
+            });
+          }
+        } catch (err) {
+          console.error(`❌ Failed to add ${kind} track for peer ${peerId}:`, err);
+        }
       } else {
-        console.warn(`⚠️ No ${kind} sender found for peer ${peerId}`);
+        // No sender and no new track - removing track scenario
+        console.log(`⚠️ No ${kind} sender found for peer ${peerId} and newTrack is null - nothing to do`);
       }
     }
   };
 
   // Add local tracks to all existing peer connections
-  const addLocalTracksToPeers = (stream: MediaStream) => {
+  const addLocalTracksToPeers = async (stream: MediaStream) => {
     console.log(`🎬 Adding local tracks to all ${peersRef.current.size} existing peers`);
     
-    peersRef.current.forEach((peer, peerId) => {
+    for (const [peerId, peer] of peersRef.current.entries()) {
       const existingSenders = peer.connection.getSenders();
+      let tracksAdded = false;
       
-      stream.getTracks().forEach(track => {
+      for (const track of stream.getTracks()) {
         const existingSender = existingSenders.find(s => s.track?.kind === track.kind);
         
         if (!existingSender) {
           console.log(`  ➕ Adding ${track.kind} track to peer ${peerId}`);
           peer.connection.addTrack(track, stream);
+          tracksAdded = true;
         } else {
-          console.log(`  🔄 Replacing ${track.kind} track for peer ${peerId}`);
-          existingSender.replaceTrack(track);
+          console.log(`  ⚠️ ${track.kind} track already exists for peer ${peerId}, replacing...`);
+          await existingSender.replaceTrack(track);
         }
-      });
-    });
+      }
+      
+      // If we added new tracks, we MUST renegotiate
+      if (tracksAdded && socket && roomId) {
+        console.log(`  🔄 Renegotiating with peer ${peerId} after adding tracks`);
+        try {
+          const offer = await peer.connection.createOffer();
+          await peer.connection.setLocalDescription(offer);
+          socket.emit('offer', {
+            to: peerId,
+            offer,
+            roomId,
+          });
+          console.log(`  ✅ Sent new offer to peer ${peerId}`);
+        } catch (err) {
+          console.error(`  ❌ Failed to renegotiate with peer ${peerId}:`, err);
+        }
+      }
+    }
   };
 
   const createOffer = async (userId: string) => {

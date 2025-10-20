@@ -38,6 +38,8 @@ const VideoCall = () => {
  setLocalStream,
  participants,
  setParticipants,
+ messages,
+ setMessages,
  } = useMeeting();
 
  const userName = searchParams.get('name') || 'Guest';
@@ -221,7 +223,7 @@ const VideoCall = () => {
  userName 
  });
 
- // IMPORTANT: Join room FIRST, even if media fails
+ // Get/generate userIdentifier
  let userIdentifier = localStorage.getItem('reactify_user_id');
  
  // TESTING: Force new identity if ?newUser=true in URL (for testing with same browser)
@@ -237,26 +239,6 @@ const VideoCall = () => {
  userIdentifier = `user_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
  localStorage.setItem('reactify_user_id', userIdentifier);
  console.log('🆔 Generated new userIdentifier:', userIdentifier);
- }
- 
- if (socket.connected && meetingId) {
- console.log('🔐 Attempting to join with userIdentifier:', userIdentifier);
- // Try to join - backend will determine if we're admin or need to request admission
- socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
- } else if (!socket.connected) {
- console.warn('⚠️ Socket not connected yet, waiting for connection...');
- // Wait for socket to connect
- socket.once('connect', () => {
- console.log('✅ Socket connected! Now joining room...');
- socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
- });
- } else {
- console.error('❌ Missing required data for join-room:', { 
- hasSocket: !!socket,
- socketConnected: socket.connected,
- meetingId, 
- userIdentifier 
- });
  }
 
  const initMedia = async () => {
@@ -287,14 +269,30 @@ const VideoCall = () => {
  setLocalStream(stream);
  setIsConnecting(false);
 
- console.log('🎬 Local stream initialized, will add tracks to peers when they connect');
+ console.log('✅ Local stream initialized with', stream.getTracks().length, 'tracks');
+ 
+ // NOW join the room AFTER media is ready
+ if (socket.connected && meetingId) {
+ console.log('🚀 Media ready! Joining room with userIdentifier:', userIdentifier);
+ socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
+ } else {
+ console.error('❌ Cannot join room - socket not connected or missing meetingId');
+ }
+ 
  } catch (error) {
  console.error('❌ Error accessing media devices:', error);
+ 
+ // Even if media fails, still join the room (without media)
+ if (socket.connected && meetingId) {
+ console.log('⚠️ Media failed, but joining room anyway (without media)');
+ socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
+ }
+ 
  toast({
  title: '⚠️ Media Error',
  description: 'Could not access camera or microphone. You can still join without media.',
  variant: 'destructive',
- duration: 5000,
+ duration: 3000,
  });
  setIsConnecting(false);
  setIsVideoOff(true);
@@ -324,7 +322,7 @@ const VideoCall = () => {
  title: '❌ Connection Error',
  description: 'Failed to connect to server. Please refresh.',
  variant: 'destructive',
- duration: 5000,
+ duration: 3000,
  });
  });
 
@@ -368,7 +366,7 @@ const VideoCall = () => {
  toast({
  title: '🚪 Join Request',
  description: `${name} wants to join the meeting`,
- duration: 5000,
+ duration: 4000,
  });
  });
 
@@ -380,7 +378,7 @@ const VideoCall = () => {
  toast({
  title: '✅ Admitted',
  description: 'You have been admitted to the meeting',
- duration: 3000,
+ duration: 2000,
  });
  });
 
@@ -390,7 +388,7 @@ const VideoCall = () => {
  title: '❌ Access Denied',
  description: message,
  variant: 'destructive',
- duration: 5000,
+ duration: 3000,
  });
  setTimeout(() => {
  navigate('/');
@@ -422,22 +420,44 @@ const VideoCall = () => {
  setWaitingUsers((prev) => prev.filter(u => u.socketId !== participant.id));
  notificationSounds.playUserJoined();
  toast({
- title: 'User Joined',
+ title: '👤 User Joined',
  description: `${participant.name} joined the meeting`,
+ duration: 2000,
  });
  });
 
  socket.on('user-left', ({ id }: { id: string }) => {
  console.log(`👋 User left: ${id}`);
- const leavingUser = participants.find(p => p.id === id);
- setParticipants((prev) => prev.filter(p => p.id !== id));
- notificationSounds.playUserLeft();
+ setParticipants((prev) => {
+ const leavingUser = prev.find(p => p.id === id);
  if (leavingUser) {
+ notificationSounds.playUserLeft();
  toast({
  title: '👋 User Left',
  description: `${leavingUser.name} left the meeting`,
+ duration: 2000, // Reduced from 3000
+ });
+ }
+ return prev.filter(p => p.id !== id);
+ });
+ });
+
+ // CRITICAL: Chat message listener must be in VideoCall, not ChatPanel
+ // This ensures messages are received even when chat panel is closed
+ socket.on('chat-message', (message) => {
+ console.log('💬 Received chat message:', message);
+ setMessages((prev) => [...prev, message]);
+ // Play notification sound and show preview for messages from others
+ if (message.senderId !== socket.id) {
+ notificationSounds.playChatMessage();
+ // Show chat preview popup if chat is closed
+ if (!isChatOpen) {
+ toast({
+ title: `💬 ${message.senderName}`,
+ description: message.text.length > 100 ? message.text.substring(0, 100) + '...' : message.text,
  duration: 3000,
  });
+ }
  }
  });
 
@@ -456,7 +476,7 @@ const VideoCall = () => {
  title: '⛔ Kicked from Meeting',
  description: message,
  variant: 'destructive',
- duration: 5000,
+ duration: 3000,
  });
  setTimeout(() => {
  navigate('/');
@@ -473,7 +493,7 @@ const VideoCall = () => {
  title: '🛑 Screen Share Stopped',
  description: message,
  variant: 'destructive',
- duration: 4000,
+ duration: 3000,
  });
  }
  });
@@ -507,7 +527,7 @@ const VideoCall = () => {
  toast({
  title: '🔴 Recording Started',
  description: 'This meeting is now being recorded',
- duration: 4000,
+ duration: 3000,
  });
  });
 
@@ -534,6 +554,7 @@ const VideoCall = () => {
  socket.off('permissions');
  socket.off('user-joined');
  socket.off('user-left');
+ socket.off('chat-message');
  socket.off('existing-participants');
  socket.off('kicked-from-meeting');
  socket.off('admin-stop-screenshare');
@@ -545,7 +566,45 @@ const VideoCall = () => {
  socket.off('recording-stopped');
  socket.off('user-kicked');
  };
- }, [socket, meetingId, setParticipants, toast, navigate]); // REMOVED: isScreenSharing, userName, localStream
+ }, [socket, meetingId, setParticipants, setMessages, toast, navigate, isChatOpen]); // Added setMessages and isChatOpen
+
+ // Cleanup on component unmount - stop all tracks and clear messages
+ useEffect(() => {
+ return () => {
+ console.log('🧹 Cleaning up VideoCall component');
+ 
+ // Stop all local stream tracks
+ if (localStream) {
+ localStream.getTracks().forEach(track => {
+ console.log(`  Stopping ${track.kind} track`);
+ track.stop();
+ });
+ }
+ 
+ // Stop screen share tracks
+ if (screenStreamRef.current) {
+ screenStreamRef.current.getTracks().forEach(track => {
+ console.log(`  Stopping screen share track`);
+ track.stop();
+ });
+ }
+ 
+ // Stop recording if active
+ if (mediaRecorderRef.current && isRecording) {
+ console.log('  Stopping recording');
+ mediaRecorderRef.current.stop();
+ }
+ 
+ // Clear chat messages for next meeting
+ console.log('  Clearing chat messages');
+ setMessages([]);
+ 
+ // Clear participants list
+ setParticipants([]);
+ 
+ console.log('✅ VideoCall cleanup complete');
+ };
+ }, [localStream, isRecording, setMessages, setParticipants]); // Dependencies ensure we have latest refs
 
  const toggleAudio = () => {
  if (localStream) {
@@ -587,15 +646,18 @@ const VideoCall = () => {
  const newVideoTrack = newStream.getVideoTracks()[0];
  const oldVideoTrack = localStream.getVideoTracks()[0];
 
- // Replace the old video track with the new one in local stream
+ // Stop and remove old video track if exists
  if (oldVideoTrack) {
- localStream.removeTrack(oldVideoTrack);
+ console.log('  Stopping old video track');
  oldVideoTrack.stop();
+ localStream.removeTrack(oldVideoTrack);
  }
+ 
+ // Add new video track to local stream
  localStream.addTrack(newVideoTrack);
 
- // Update the track in all peer connections
- replaceTrack('video', newVideoTrack);
+ // Update the track in all peer connections WITH renegotiation
+ await replaceTrack('video', newVideoTrack, true);
 
  // Force update by creating a new MediaStream reference
  const updatedStream = new MediaStream([
@@ -626,8 +688,8 @@ const VideoCall = () => {
  videoTrack.stop();
  localStream.removeTrack(videoTrack);
  
- // Update peer connections to remove video track
- replaceTrack('video', null);
+ // Update peer connections to remove video track WITH renegotiation
+ await replaceTrack('video', null, true);
  
  setIsVideoOff(true);
  
@@ -823,15 +885,36 @@ const VideoCall = () => {
  };
 
  const leaveMeeting = () => {
+ console.log('👋 Leaving meeting - cleaning up resources');
+ 
+ // Stop all local stream tracks (camera, microphone)
  if (localStream) {
- localStream.getTracks().forEach(track => track.stop());
+ localStream.getTracks().forEach(track => {
+ console.log(`  Stopping ${track.kind} track`);
+ track.stop();
+ });
  }
+ 
+ // Stop screen share tracks
  if (screenStreamRef.current) {
- screenStreamRef.current.getTracks().forEach(track => track.stop());
+ screenStreamRef.current.getTracks().forEach(track => {
+ console.log('  Stopping screen share track');
+ track.stop();
+ });
  }
+ 
+ // Stop recording if active
  if (mediaRecorderRef.current && isRecording) {
+ console.log('  Stopping recording');
  mediaRecorderRef.current.stop();
  }
+ 
+ // Clear chat messages and participants for next meeting
+ console.log('  Clearing chat messages and participants');
+ setMessages([]);
+ setParticipants([]);
+ 
+ console.log('✅ Cleanup complete, navigating to home');
  navigate('/');
  };
 

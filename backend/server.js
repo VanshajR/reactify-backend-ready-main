@@ -492,11 +492,16 @@ io.on('connection', (socket) => {
  });
 
  socket.on('chat-message', ({ roomId, message }) => {
- console.log(`💬 Chat message from ${message.senderName} in room ${roomId}`);
- console.log(`   Room has ${rooms.get(roomId)?.size || 0} participants`);
+ console.log(`💬 Chat message from ${message.senderName} (${socket.id}) in room ${roomId}`);
+ console.log(`   Sender in Socket.IO room: ${io.sockets.adapter.rooms.get(roomId)?.has(socket.id)}`);
+ console.log(`   Room has ${rooms.get(roomId)?.size || 0} participants in tracking Map`);
  const room = io.sockets.adapter.rooms.get(roomId);
- console.log(`   Socket.IO room has ${room?.size || 0} sockets`);
+ console.log(`   Socket.IO room has ${room?.size || 0} total sockets`);
+ if (room) {
+ console.log(`   Sockets in room:`, Array.from(room));
+ }
  io.to(roomId).emit('chat-message', message);
+ console.log(`   ✅ Broadcasted chat message to room ${roomId}`);
  });
 
  socket.on('toggle-audio', ({ roomId, isMuted }) => {

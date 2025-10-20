@@ -6,7 +6,6 @@ import { useMeeting } from '@/context/MeetingContext';
 import { useSocket } from '@/context/SocketContext';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
-import { notificationSounds } from '@/utils/notifications';
 
 const ChatPanel = () => {
  const { setIsChatOpen, messages, setMessages } = useMeeting();
@@ -18,21 +17,9 @@ const ChatPanel = () => {
  const [messageText, setMessageText] = useState('');
  const messagesEndRef = useRef<HTMLDivElement>(null);
 
- useEffect(() => {
- if (!socket) return;
-
- socket.on('chat-message', (message) => {
- setMessages((prev) => [...prev, message]);
- // Play notification sound only for messages from others
- if (message.senderId !== socket.id) {
- notificationSounds.playChatMessage();
- }
- });
-
- return () => {
- socket.off('chat-message');
- };
- }, [socket, setMessages]);
+ // REMOVED: Chat message listener moved to VideoCall.tsx
+ // This ensures messages are received even when chat panel is closed
+ // The listener must always be active, not conditionally mounted
 
  useEffect(() => {
  messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -49,6 +36,7 @@ const ChatPanel = () => {
  timestamp: new Date(),
  };
 
+ // Send to backend - backend will broadcast to all (including sender)
  socket.emit('chat-message', { roomId: meetingId, message });
  setMessageText('');
  };
