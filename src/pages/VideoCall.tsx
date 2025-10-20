@@ -64,6 +64,7 @@ const VideoCall = () => {
  const screenStreamRef = useRef<MediaStream | null>(null);
  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
  const recordedChunksRef = useRef<Blob[]>([]);
+ const isLeavingRef = useRef(false); // Track if user is intentionally leaving
  
  // Refs to access latest values in cleanup handlers without causing re-renders
  const socketRef = useRef(socket);
@@ -237,6 +238,20 @@ const VideoCall = () => {
  userName 
  });
 
+ // CRITICAL FIX: Reconnect socket if it was manually disconnected
+ // BUT ONLY if user is not intentionally leaving the meeting
+ if (!socket.connected && !isLeavingRef.current) {
+ console.log('🔄 Socket disconnected - reconnecting...');
+ socket.connect();
+ // Wait for connection before proceeding
+ socket.once('connect', () => {
+ console.log('✅ Socket reconnected:', socket.id);
+ });
+ } else if (isLeavingRef.current) {
+ console.log('👋 User is leaving - NOT reconnecting socket');
+ return; // Don't initialize media if leaving
+ }
+
  // Get/generate userIdentifier
  let userIdentifier = localStorage.getItem('reactify_user_id');
  
@@ -286,6 +301,29 @@ const VideoCall = () => {
  console.log('✅ Local stream initialized with', stream.getTracks().length, 'tracks');
  
  // NOW join the room AFTER media is ready
+ // Wait for socket to be connected (max 3 seconds)
+ const waitForConnection = () => {
+ return new Promise<void>((resolve) => {
+ if (socket.connected) {
+ resolve();
+ } else {
+ console.log('⏳ Waiting for socket to connect...');
+ const timeout = setTimeout(() => {
+ console.warn('⚠️ Socket connection timeout - proceeding anyway');
+ resolve();
+ }, 3000);
+ 
+ socket.once('connect', () => {
+ clearTimeout(timeout);
+ console.log('✅ Socket connected, proceeding with join');
+ resolve();
+ });
+ }
+ });
+ };
+
+ await waitForConnection();
+ 
  if (socket.connected && meetingId) {
  console.log('🚀 Media ready! Joining room with userIdentifier:', userIdentifier);
  socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
@@ -297,6 +335,28 @@ const VideoCall = () => {
  console.error('❌ Error accessing media devices:', error);
  
  // Even if media fails, still join the room (without media)
+ // Wait for socket connection first
+ const waitForConnection = () => {
+ return new Promise<void>((resolve) => {
+ if (socket.connected) {
+ resolve();
+ } else {
+ console.log('⏳ Waiting for socket to connect...');
+ const timeout = setTimeout(() => {
+ console.warn('⚠️ Socket connection timeout - proceeding anyway');
+ resolve();
+ }, 3000);
+ 
+ socket.once('connect', () => {
+ clearTimeout(timeout);
+ resolve();
+ });
+ }
+ });
+ };
+
+ await waitForConnection();
+ 
  if (socket.connected && meetingId) {
  console.log('⚠️ Media failed, but joining room anyway (without media)');
  socket.emit('join-room', { roomId: meetingId, userName, userIdentifier });
@@ -525,7 +585,12 @@ const VideoCall = () => {
  // Handle admin transfer when current admin leaves
  socket.on('admin-transferred', ({ message }: { message: string }) => {
  console.log('👑 ADMIN-TRANSFERRED: You are now the admin!');
+ console.log('   Setting isAdmin to true');
  setIsAdmin(true);
+ 
+ // Ensure we're not in waiting room
+ setInWaitingRoom(false);
+ 
  toast({
  title: '👑 Host Transfer',
  description: message,
@@ -1068,6 +1133,9 @@ const VideoCall = () => {
 
  const leaveMeeting = () => {
  console.log('👋 Leaving meeting - cleaning up resources');
+ 
+ // Set flag to prevent socket reconnection
+ isLeavingRef.current = true;
  
  // Stop all local stream tracks (camera, microphone)
  if (localStream) {

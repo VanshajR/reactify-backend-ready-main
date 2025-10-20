@@ -257,18 +257,32 @@ io.on('connection', (socket) => {
  const room = rooms.get(roomId);
  console.log(`🚪 ${userName} in waiting room. Notifying admins...`);
  console.log(`   Room has ${room.size} participants`);
+ console.log(`   Checking each participant for admin status...`);
  
  let adminCount = 0;
  room.forEach((participant, participantSocketId) => {
- console.log(`   Participant ${participant.name} (${participantSocketId}): isAdmin=${participant.isAdmin}`);
+ console.log(`   📋 Participant ${participant.name} (${participantSocketId}):`);
+ console.log(`      - isAdmin: ${participant.isAdmin}`);
+ console.log(`      - userIdentifier: ${participant.userIdentifier}`);
+ 
  if (participant.isAdmin) {
  adminCount++;
- console.log(`   ✉️ Sending join-request to admin ${participant.name}`);
- io.to(participantSocketId).emit('join-request', {
+ console.log(`      ✉️ Sending join-request to admin ${participant.name}`);
+ 
+ // Get the socket directly to ensure delivery
+ const adminSocket = io.sockets.sockets.get(participantSocketId);
+ if (adminSocket) {
+ adminSocket.emit('join-request', {
  socketId: socket.id,
  name: userName,
  userIdentifier,
  });
+ console.log(`      ✅ join-request delivered to ${participant.name}`);
+ } else {
+ console.log(`      ❌ Socket ${participantSocketId} not found!`);
+ }
+ } else {
+ console.log(`      ⏭️ Skipping - not an admin`);
  }
  });
 
@@ -634,9 +648,20 @@ io.on('connection', (socket) => {
  if (wasAdmin && room.size > 0) {
  const newAdminSocketId = remainingSockets[0];
  const newAdminData = room.get(newAdminSocketId);
+ 
+ console.log(`   👑 ADMIN TRANSFER INITIATED`);
+ console.log(`   Old admin: ${userName} (${socket.id})`);
+ console.log(`   New admin candidate: ${newAdminData?.name} (${newAdminSocketId})`);
+ console.log(`   New admin data before update:`, newAdminData);
+ 
  if (newAdminData) {
  newAdminData.isAdmin = true;
  room.set(newAdminSocketId, newAdminData);
+ 
+ // Verify the update
+ const verifyAdmin = room.get(newAdminSocketId);
+ console.log(`   ✅ Admin flag updated. Verification:`, verifyAdmin);
+ console.log(`   ✅ isAdmin is now: ${verifyAdmin?.isAdmin}`);
  
  // Update permissions for new admin (grant all permissions)
  permissions.set(newAdminSocketId, {
@@ -645,7 +670,6 @@ io.on('connection', (socket) => {
  allowScreenShare: true,
  });
  
- console.log(`   👑 Admin left! Transferring admin to ${newAdminData.name} (${newAdminSocketId})`);
  console.log(`   🔑 Granted full permissions to new admin`);
  
  // Update database - transfer ownership to new admin
@@ -692,6 +716,12 @@ io.on('connection', (socket) => {
  });
  
  console.log(`   ✅ ${newAdminData.name} is now the admin of room ${roomId}`);
+ 
+ // Verify room state after transfer
+ console.log(`   📋 Room state after admin transfer:`);
+ room.forEach((p, pSocketId) => {
+ console.log(`      - ${p.name} (${pSocketId}): isAdmin=${p.isAdmin}`);
+ });
  }
  }
  
